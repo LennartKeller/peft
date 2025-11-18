@@ -383,9 +383,11 @@ class FXLoraModel(BaseTuner):
             raise ValueError(f"Number of active adapters must be {self.fxlora_config.num_active}, got {len(adapters)}")
         self.lora_model.set_adapter(adapters)
         model_device = self.device
-        for name, param in self.lora_model.named_parameters():
+        for name, param in self.named_parameters():
             adapter_name, is_inactive = self._param_belongs_to_adapter(name, which="inactive")
-            print_dbg(f"Processing parameter {name=}, {adapter_name=}, {is_inactive=}")
+            if not adapter_name:
+                continue
+            print_dbg(f"Processing adapter parameter {name=}, {adapter_name=}, {is_inactive=}")
             if is_inactive:
                 if offload_device and param.device != offload_device:
                     print_dbg(f"Offloading inactive parameter {name} to {offload_device=}")
@@ -393,7 +395,8 @@ class FXLoraModel(BaseTuner):
             else:
                 if param.device != model_device:
                     print_dbg(f"Bringing active parameter {name} back to {model_device=}")
-                    param = param.to(model_device)
+                    with torch.no_grad():
+                        param.data = param.data.to(model_device)
                 if isinstance(adapters, dict) and adapter_name in adapters:
                     param.requires_grad = adapters[adapter_name]
                 else:
