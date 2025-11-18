@@ -64,6 +64,7 @@ from .utils import (
     infer_device,
     load_peft_weights,
     map_cache_to_layer_device_map,
+    print_dbg,
     set_peft_model_state_dict,
     shift_tokens_right,
 )
@@ -124,6 +125,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         else:
             self._peft_config = None
             cls = PEFT_TYPE_TO_TUNER_MAPPING[peft_config.peft_type]
+            print_dbg(f"Initializing PEFT model of type {peft_config.peft_type} using class {cls.__name__}")
             ctx = init_empty_weights if low_cpu_mem_usage else nullcontext
             with ctx():
                 self.base_model = cls(model, {adapter_name: peft_config}, adapter_name)

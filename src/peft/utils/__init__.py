@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .debug import DEBUG, print_dbg
 from .integrations import map_cache_to_layer_device_map
 from .loftq_utils import replace_lora_weights_loftq
 from .other import (
@@ -72,6 +73,7 @@ from .warning import PeftWarning
 
 __all__ = [
     "CONFIG_NAME",
+    "DEBUG",
     "INCLUDE_LINEAR_LAYERS_SHORTHAND",
     "SAFETENSORS_WEIGHTS_NAME",
     "TRANSFORMERS_MODELS_TO_ADALORA_TARGET_MODULES_MAPPING",
@@ -123,6 +125,7 @@ __all__ = [
     "load_peft_weights",
     "map_cache_to_layer_device_map",
     "prepare_model_for_kbit_training",
+    "print_dbg",
     "register_peft_method",
     "replace_lora_weights_loftq",
     "set_additional_trainable_modules",

@@ -31,6 +31,8 @@ class FXLoraConfig(PeftConfig):
     Args:
         hidden_size (`int`):
             Hidden size of the base model.
+        num_active (`int`):
+            Number of active LoRA adapters to use at each forward pass.
         adapters (`dict`):
             Mapping of adapter names to the LoRA adapter id, as per PeftModel.load_adapter. *They will be automatically
             loaded*, to use as LoRA experts. When using from_pretrained, pass the new adapters dict as a keyword
@@ -62,6 +64,7 @@ class FXLoraConfig(PeftConfig):
     """
 
     hidden_size: int = None  # type: ignore
+    num_active: int = None
     adapters: dict[str, str] = None  # type: ignore
     enable_softmax: bool = True
     enable_softmax_topk: bool = False
@@ -77,7 +80,7 @@ class FXLoraConfig(PeftConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        self.peft_type = PeftType.XLORA
+        self.peft_type = PeftType.FXLORA
 
         if self.hidden_size is None:
             warnings.warn(

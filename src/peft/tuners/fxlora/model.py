@@ -14,9 +14,9 @@
 from __future__ import annotations
 
 import copy
-from contextlib import contextmanager
+from contextlib import ContextDecorator, contextmanager
 from functools import partial
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -24,6 +24,7 @@ import torch.nn as nn
 from peft.tuners.lora.layer import LoraLayer
 from peft.tuners.lora.model import LoraModel
 from peft.tuners.tuners_utils import BaseTuner
+from peft.utils import print_dbg
 from peft.utils.constants import DUMMY_TARGET_MODULES
 from peft.utils.save_and_load import set_peft_model_state_dict
 
@@ -31,6 +32,27 @@ from .. import lora
 from .classifier import FXLoraClassifier
 from .config import FXLoraConfig
 from .layer import FXLoraConv2dLayer, FXLoraEmbeddingLayer, FXLoraLinearLayer
+
+
+class if_eval_no_grad(ContextDecorator):
+    def __init__(self, model):
+        self.model = model
+        self._use_no_grad = False
+        self._ctx = None
+
+    def __enter__(self):
+        # Only activate no_grad if model.eval() has been called
+        self._use_no_grad = not self.model.training
+        if self._use_no_grad:
+            print_dbg("'if_eval_no_grad': Entering no_grad context for eval")
+            self._ctx = torch.no_grad()
+            self._ctx.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._use_no_grad:
+            self._ctx.__exit__(exc_type, exc, tb)
+        return False
 
 
 def convert_layers_to_xlora(
@@ -130,11 +152,18 @@ def _load_adapter_into_lora_model(
     for old_key in adapter_weights.keys():
         key: str = old_key
         # Remove all the prefixes until we have model.<...>
+
+        # Fix from: https://github.com/huggingface/peft/issues/2132#issuecomment-2443013915
         while not (key.startswith("model.") and not key.startswith("model.model.")):
             key = key[key.find(".") + 1 :]
+
         # We always want model.model
+        if key.startswith("model.model") or key.startswith("model."):
+            key = key.replace("model.", "")
+
         key = "model." + key
         new_adapter_weights[key] = adapter_weights[old_key]
+        print_dbg(key, old_key)
 
     # load the weights into the model
     ignore_mismatched_sizes = kwargs.get("ignore_mismatched_sizes", False)
@@ -153,7 +182,7 @@ def _load_adapter_into_lora_model(
         lora_model._cast_adapter_dtype(adapter_name=adapter_name, autocast_adapter_dtype=autocast_adapter_dtype)
 
 
-class XLoraModel(BaseTuner):
+class FXLoraModel(BaseTuner):
     """
     Creates an X-LoRA (Mixture of LoRA experts), model from a pretrained transformers model. Currently, this X-LoRA
     implementation only works with models with a transformer architecture.
@@ -197,6 +226,11 @@ class XLoraModel(BaseTuner):
         >>> xlora_model = get_peft_model(model, config)
         ```
     """
+
+    # Used to locate adapters with the model
+    # TODO extend as needed
+    # TODO what about embeddings?
+    ADAPTER_KEYS = ("lora_A", "lora_B")
 
     def __init__(
         self,
@@ -248,7 +282,7 @@ class XLoraModel(BaseTuner):
         base_lora_config.bias = "none"
         lora_model = LoraModel(model, base_lora_config, adapter_name)
 
-        self.xlora_config = conf
+        self.fxlora_config = conf
         self.lora_model = lora_model
 
         peft_config = conf
@@ -257,12 +291,12 @@ class XLoraModel(BaseTuner):
             raise ValueError("`use_cache` must be False")
 
         adapters_items = peft_config.adapters.items()
-        if hasattr(self.xlora_config, "_subfolders"):
-            adapters_items = zip(peft_config.adapters.items(), self.xlora_config._subfolders)
+        if hasattr(self.fxlora_config, "_subfolders"):
+            adapters_items = zip(peft_config.adapters.items(), self.fxlora_config._subfolders)
         else:
             adapters_items = peft_config.adapters.items()
 
-        if hasattr(self.xlora_config, "_subfolders"):
+        if hasattr(self.fxlora_config, "_subfolders"):
             for i, (_adapter_name, model_id), subfolder in enumerate(adapters_items):
                 _load_adapter_into_lora_model(
                     lora_model=self.lora_model,
@@ -297,7 +331,8 @@ class XLoraModel(BaseTuner):
             peft_config,
         )
 
-        n_classes = len(peft_config.adapters)
+        # n_classes = len(peft_config.adapters)
+        n_classes = peft_config.num_active
         xlora_classifier = FXLoraClassifier(model, peft_config, n_classes, total_swapped, device)
 
         # Setup the model internal state
@@ -306,12 +341,68 @@ class XLoraModel(BaseTuner):
         # Controlled by enable_adapter_layers or disable_adapter_layers
         self.disabled = False
 
+        # Check if we have
+
     def _maybe_freeze_all_adapters(self):
         self.eval()
-        if not self.xlora_config.use_trainable_adapters:
+        if not self.fxlora_config.use_trainable_adapters:
             for name, param in self.named_parameters():
                 if "lora_" in name:
                     param.requires_grad = False
+
+    def _param_belongs_to_adapter(
+        self, name: str, which: Literal["active", "inactive", "both"] = "active"
+    ) -> tuple[str, bool]:
+        parts = name.split(".")
+        if not any(key in parts for key in self.ADAPTER_KEYS):
+            return "", False
+        lora_part_index = parts.index("lora_A") if "lora_A" in parts else parts.index("lora_B")
+        adapter_name = parts[lora_part_index + 1]
+        if which == "active":
+            return adapter_name, adapter_name in self.active_adapters
+        elif which == "inactive":
+            return adapter_name, adapter_name not in self.active_adapters
+        else:
+            return adapter_name, True
+
+    def activate_adapters(
+        self, adapters: Union[list[str], dict[str, bool]], offload_device: Optional[Union[torch.device, str]] = None
+    ):
+        """
+        Activates the specified adapters for use during forward passes.
+
+        Args:
+            adapters (`Union[list[str], dict[str, bool]]`):
+                Either a list of adapter names to activate, or a dictionary mapping adapter names to booleans
+                indicating whether to unfreeze them. If a list is provided, all activated adapters will have their
+                parameters frozen.
+            offload_device (`Optional[Union[torch.device, str]]`, *optional*, defaults to `None`):
+                If specified, inactive adapters will be offloaded to this device to save memory.
+        """
+        if len(adapters) != self.fxlora_config.num_active:
+            raise ValueError(f"Number of active adapters must be {self.fxlora_config.num_active}, got {len(adapters)}")
+        self.lora_model.set_adapter(adapters)
+        model_device = self.device
+        for name, param in self.lora_model.named_parameters():
+            adapter_name, is_inactive = self._param_belongs_to_adapter(name, which="inactive")
+            print_dbg(f"Processing parameter {name=}, {adapter_name=}, {is_inactive=}")
+            if is_inactive:
+                if offload_device and param.device != offload_device:
+                    print_dbg(f"Offloading inactive parameter {name} to {offload_device=}")
+                    param.data = param.data.to(offload_device)
+            else:
+                if param.device != model_device:
+                    print_dbg(f"Bringing active parameter {name} back to {model_device=}")
+                    param = param.to(model_device)
+                if isinstance(adapters, dict) and adapter_name in adapters:
+                    param.requires_grad = adapters[adapter_name]
+                else:
+                    param.requires_grad = False
+
+    def _unfreeze_all_adapters(self):
+        for name, param in self.named_parameters():
+            if "lora_" in name:
+                param.requires_grad = True
 
     def generate(self, *args, **kwargs):
         kwargs["use_cache"] = False
@@ -330,6 +421,7 @@ class XLoraModel(BaseTuner):
         hook_handles = []
 
         def _pre_forward(module, *args, **kwargs):
+            print_dbg("FXLoRA _pre_forward called")
             # =========================== Forward pass with "dummy" scalings ==================
             nonlocal hook_handles
 
@@ -352,6 +444,8 @@ class XLoraModel(BaseTuner):
                     hook_handles.append(handle)
 
             with torch.no_grad():
+                # with if_eval_no_grad(self):
+                print_dbg(f"FXLoRA scaling pass forward: {self.training=}")
                 self.lora_model.disable_adapter_layers()
 
                 try:
